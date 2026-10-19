@@ -1,1 +1,502 @@
+<?php
+/**
+ * AJAX Admin Page: Cleanup attribute terms.
+ * - Filters: Attribute, Status (All/Used/Unused), Search
+ * - Checkbox selection for bulk delete
+ * - Per-row Delete buttons
+ * - Used terms cannot be selected or deleted (multiple safety layers)
+ */
 
+// ------------------------------------------------------------------
+// 1. Register admin menu page
+// ------------------------------------------------------------------
+add_action( 'admin_menu', function() {
+    add_submenu_page(
+        'woocommerce',
+        'Cleanup Unused Attributes',
+        'Cleanup Unused Attributes',
+        'manage_options',
+        'cleanup-attribute-terms',
+        'cleanup_attribute_terms_page_html'
+    );
+} );
+
+// ------------------------------------------------------------------
+// 2. Render page
+// ------------------------------------------------------------------
+function cleanup_attribute_terms_page_html() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_die( 'Insufficient permissions.' );
+    }
+
+    $attributes = wc_get_attribute_taxonomies();
+
+    if ( empty( $attributes ) ) {
+        echo '<div class="wrap"><h1>Cleanup Unused Attributes</h1><p>No WooCommerce attributes found.</p></div>';
+        return;
+    }
+
+    // Collect ALL terms (used AND unused)
+    $all_terms = array();
+    foreach ( $attributes as $attr ) {
+        $taxonomy = wc_attribute_taxonomy_name( $attr->attribute_name );
+        if ( ! taxonomy_exists( $taxonomy ) ) {
+            continue;
+        }
+        $terms = get_terms( array( 'taxonomy' => $taxonomy, 'hide_empty' => false ) );
+        if ( empty( $terms ) || is_wp_error( $terms ) ) {
+            continue;
+        }
+        foreach ( $terms as $term ) {
+            $all_terms[] = array(
+                'term'     => $term,
+                'taxonomy' => $taxonomy,
+                'slug'     => $attr->attribute_name,
+                'label'    => $attr->attribute_label,
+                'used'     => ( (int) $term->count > 0 ) ? '1' : '0',
+            );
+        }
+    }
+
+    $total_used   = 0;
+    $total_unused = 0;
+    foreach ( $all_terms as $t ) {
+        if ( $t['used'] === '1' ) { $total_used++; } else { $total_unused++; }
+    }
+
+    $nonce_single = wp_create_nonce( 'cleanup_single_term_nonce' );
+    $nonce_bulk   = wp_create_nonce( 'cleanup_bulk_terms_nonce' );
+    ?>
+    <div class="wrap">
+        <h1>Cleanup Attribute Terms</h1>
+
+        <p style="font-size:14px;">
+            <strong>Total terms:</strong> <?php echo count( $all_terms ); ?> &nbsp;|&nbsp;
+            <strong style="color:#0073aa;">Used (in use):</strong> <?php echo $total_used; ?> &nbsp;|&nbsp;
+            <strong style="color:#b00;">Unused (safe to delete):</strong> <?php echo $total_unused; ?>
+        </p>
+
+        <?php if ( empty( $all_terms ) ) : ?>
+            <div class="notice notice-success"><p>✅ No attribute terms found.</p></div>
+        <?php else : ?>
+
+            <!-- FILTER BAR -->
+            <div class="tablenav top" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:16px 0;padding:12px;background:#f6f7f7;border:1px solid #dcdcde;border-radius:4px;">
+                <label for="filter-attribute"><strong>Attribute:</strong></label>
+                <select id="filter-attribute">
+                    <option value="">All attributes</option>
+                    <?php foreach ( $attributes as $attr ) : ?>
+                        <option value="<?php echo esc_attr( $attr->attribute_name ); ?>">
+                            <?php echo esc_html( $attr->attribute_label ); ?>
+                        </option>
+                    <?php endforeach; ?>
+                </select>
+
+                <label for="filter-status"><strong>Status:</strong></label>
+                <select id="filter-status">
+                    <option value="all" selected>All terms (used + unused)</option>
+                    <option value="unused">Unused only (safe to delete)</option>
+                    <option value="used">Used only (in use)</option>
+                </select>
+
+                <label for="filter-search"><strong>Search:</strong></label>
+                <input type="search" id="filter-search" placeholder="Term name or slug..." style="min-width:200px;" />
+
+                <span id="filter-count" style="margin-left:auto;font-weight:600;color:#555;"></span>
+            </div>
+
+            <!-- BULK ACTION BAR -->
+            <div id="bulk-bar" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 12px 0;padding:10px 12px;background:#fff;border:1px solid #dcdcde;border-radius:4px;">
+                <label style="display:flex;align-items:center;gap:6px;">
+                    <input type="checkbox" id="select-all-visible" />
+                    <strong>Select all visible unused</strong>
+                </label>
+                <button type="button" id="clear-selection" class="button">Clear selection</button>
+                <button type="button" id="bulk-delete-btn" class="button button-primary" disabled>
+                    Delete selected (<span id="selected-count">0</span>)
+                </button>
+                <span id="bulk-status" style="font-weight:600;"></span>
+            </div>
+
+            <table class="widefat striped" id="cleanup-terms-table">
+                <thead>
+                    <tr>
+                        <th style="width:40px;"><input type="checkbox" id="header-checkbox" title="Toggle visible unused" /></th>
+                        <th style="width:50px;">#</th>
+                        <th>Attribute</th>
+                        <th style="width:80px;">Term ID</th>
+                        <th>Name</th>
+                        <th>Slug</th>
+                        <th style="width:70px;">Count</th>
+                        <th style="width:130px;">Status</th>
+                        <th style="width:110px;">Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php $i = 1; foreach ( $all_terms as $item ) :
+                        $term      = $item['term'];
+                        $taxonomy  = $item['taxonomy'];
+                        $label     = $item['label'];
+                        $slug      = $item['slug'];
+                        $used_flag = $item['used'];
+                        $is_used   = ( $used_flag === '1' );
+                        ?>
+                        <tr data-term-id="<?php echo esc_attr( $term->term_id ); ?>"
+                            data-taxonomy="<?php echo esc_attr( $taxonomy ); ?>"
+                            data-attribute="<?php echo esc_attr( $slug ); ?>"
+                            data-used="<?php echo esc_attr( $used_flag ); ?>"
+                            data-name="<?php echo esc_attr( strtolower( $term->name ) ); ?>"
+                            data-slug="<?php echo esc_attr( strtolower( $term->slug ) ); ?>"
+                            style="<?php echo $is_used ? 'background:#eef6ff;' : ''; ?>">
+                            <td>
+                                <?php if ( ! $is_used ) : ?>
+                                    <input type="checkbox" class="term-checkbox"
+                                           value="<?php echo esc_attr( $term->term_id ); ?>"
+                                           data-taxonomy="<?php echo esc_attr( $taxonomy ); ?>"
+                                           data-name="<?php echo esc_attr( $term->name ); ?>" />
+                                <?php endif; ?>
+                            </td>
+                            <td class="row-num"><?php echo $i++; ?></td>
+                            <td><strong><?php echo esc_html( $label ); ?></strong><br><code><?php echo esc_html( $taxonomy ); ?></code></td>
+                            <td><?php echo esc_html( $term->term_id ); ?></td>
+                            <td class="term-name"><?php echo esc_html( $term->name ); ?></td>
+                            <td class="term-slug"><?php echo esc_html( $term->slug ); ?></td>
+                            <td><strong><?php echo esc_html( $term->count ); ?></strong></td>
+                            <td>
+                                <?php if ( $is_used ) : ?>
+                                    <span style="color:#0073aa;font-weight:600;">● Used</span>
+                                <?php else : ?>
+                                    <span style="color:#b00;font-weight:600;">○ Unused</span>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?php if ( ! $is_used ) : ?>
+                                    <button type="button"
+                                            class="button button-primary delete-term-btn"
+                                            data-term-id="<?php echo esc_attr( $term->term_id ); ?>"
+                                            data-taxonomy="<?php echo esc_attr( $taxonomy ); ?>"
+                                            data-term-name="<?php echo esc_attr( $term->name ); ?>">
+                                        Delete
+                                    </button>
+                                    <span class="term-status" style="margin-left:4px;font-weight:600;"></span>
+                                <?php else : ?>
+                                    <span style="color:#aaa;">—</span>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+
+            <div id="no-match-notice" class="notice notice-warning" style="display:none;margin-top:12px;">
+                <p>No terms match the current filters.</p>
+            </div>
+
+            <script>
+            (function($){
+                var nonceSingle = <?php echo wp_json_encode( $nonce_single ); ?>;
+                var nonceBulk   = <?php echo wp_json_encode( $nonce_bulk ); ?>;
+                var ajaxUrl     = <?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>;
+
+                // -------- FILTERING --------
+                function applyFilters() {
+                    var attr   = String( $('#filter-attribute').val() || '' ).toLowerCase();
+                    var status = String( $('#filter-status').val() || 'all' );
+                    var q      = $.trim( String( $('#filter-search').val() || '' ) ).toLowerCase();
+                    var visible = 0;
+
+                    $('#cleanup-terms-table tbody tr').each(function(){
+                        var $row = $(this);
+                        var rowAttr = String( $row.attr('data-attribute') || '' ).toLowerCase();
+                        var rowUsed = String( $row.attr('data-used') || '0' );
+                        var rowName = String( $row.attr('data-name') || '' );
+                        var rowSlug = String( $row.attr('data-slug') || '' );
+
+                        var attrOk = ( attr === '' ) || ( rowAttr === attr );
+
+                        var statusOk = true;
+                        if ( status === 'unused' ) statusOk = ( rowUsed === '0' );
+                        if ( status === 'used' )   statusOk = ( rowUsed === '1' );
+
+                        var qOk = ( q === '' ) || ( rowName.indexOf(q) !== -1 ) || ( rowSlug.indexOf(q) !== -1 );
+
+                        if ( attrOk && statusOk && qOk ) {
+                            $row.show();
+                            visible++;
+                        } else {
+                            $row.hide();
+                            // Uncheck hidden rows so hidden selections can't sneak in
+                            $row.find('.term-checkbox').prop('checked', false);
+                        }
+                    });
+
+                    renumberRows();
+                    updateSelectedCount();
+                    $('#filter-count').text( visible + ' visible' );
+                    $('#no-match-notice').toggle( visible === 0 );
+                }
+
+                $('#filter-attribute, #filter-status').on('change', applyFilters);
+                $('#filter-search').on('input', applyFilters);
+                applyFilters();
+
+                // -------- SELECTION --------
+                function updateSelectedCount() {
+                    var count = $('.term-checkbox:checked').length;
+                    $('#selected-count').text( count );
+                    $('#bulk-delete-btn').prop('disabled', count === 0);
+
+                    // Update "select all" checkbox state
+                    var visibleBoxes = $('.term-checkbox:visible');
+                    var visibleChecked = visibleBoxes.filter(':checked').length;
+                    var $all = $('#select-all-visible');
+                    if ( visibleBoxes.length === 0 ) {
+                        $all.prop('checked', false).prop('indeterminate', false);
+                    } else if ( visibleChecked === visibleBoxes.length ) {
+                        $all.prop('checked', true).prop('indeterminate', false);
+                    } else if ( visibleChecked === 0 ) {
+                        $all.prop('checked', false).prop('indeterminate', false);
+                    } else {
+                        $all.prop('indeterminate', true);
+                    }
+                }
+
+                $(document).on('change', '.term-checkbox', updateSelectedCount);
+
+                // Select all visible
+                $('#select-all-visible, #header-checkbox').on('change', function(){
+                    var checked = $(this).prop('checked');
+                    $('.term-checkbox:visible').prop('checked', checked);
+                    $('#select-all-visible').prop('checked', checked);
+                    $('#header-checkbox').prop('checked', checked);
+                    updateSelectedCount();
+                });
+
+                $('#clear-selection').on('click', function(){
+                    $('.term-checkbox').prop('checked', false);
+                    $('#select-all-visible, #header-checkbox').prop('checked', false).prop('indeterminate', false);
+                    updateSelectedCount();
+                });
+
+                // -------- BULK DELETE --------
+                $('#bulk-delete-btn').on('click', function(){
+                    var selected = $('.term-checkbox:checked');
+                    if ( selected.length === 0 ) { return; }
+
+                    var items = [];
+                    selected.each(function(){
+                        items.push({
+                            term_id:  $(this).val(),
+                            taxonomy: $(this).attr('data-taxonomy'),
+                            name:     $(this).attr('data-name')
+                        });
+                    });
+
+                    if ( ! confirm('Delete ' + items.length + ' selected term(s)?\n\nThis cannot be undone.') ) {
+                        return;
+                    }
+
+                    var $btn    = $(this);
+                    var $status = $('#bulk-status');
+                    $btn.prop('disabled', true).text('Deleting...');
+                    $status.text('').css('color', '#555');
+
+                    $.ajax({
+                        url: ajaxUrl,
+                        type: 'POST',
+                        dataType: 'json',
+                        data: {
+                            action: 'cleanup_bulk_terms_delete',
+                            nonce: nonceBulk,
+                            items: items
+                        }
+                    }).done(function(resp){
+                        if ( resp && resp.success ) {
+                            $status.text('✅ ' + resp.data.message).css('color', 'green');
+
+                            // Fade out deleted rows
+                            $.each( resp.data.deleted_ids || [], function(_, id){
+                                $('#cleanup-terms-table tr[data-term-id="' + id + '"]').fadeOut(300, function(){
+                                    $(this).remove();
+                                    applyFilters();
+                                });
+                            });
+
+                            // Show failures if any
+                            if ( resp.data.failed && resp.data.failed.length ) {
+                                var failMsg = resp.data.failed.map(function(f){
+                                    return f.term_id + ' (' + (f.reason || 'failed') + ')';
+                                }).join(', ');
+                                $status.append('<br><span style="color:#b00;">Failed: ' + failMsg + '</span>');
+                            }
+
+                            updateSelectedCount();
+                        } else {
+                            var msg = (resp && resp.data && resp.data.message) ? resp.data.message : 'Unknown error';
+                            $status.text('❌ ' + msg).css('color', 'red');
+                        }
+                        $btn.text('Delete selected (' + $('.term-checkbox:checked').length + ')')
+                            .prop('disabled', $('.term-checkbox:checked').length === 0);
+                    }).fail(function(xhr){
+                        $status.text('❌ Request failed (' + xhr.status + ')').css('color', 'red');
+                        $btn.text('Delete selected').prop('disabled', false);
+                    });
+                });
+
+                // -------- PER-ROW DELETE --------
+                $(document).on('click', '.delete-term-btn', function(){
+                    var $btn    = $(this);
+                    var termId  = $btn.data('term-id');
+                    var tax     = $btn.data('taxonomy');
+                    var name    = $btn.data('term-name');
+                    var $row    = $btn.closest('tr');
+                    var $status = $row.find('.term-status');
+
+                    if ( ! confirm('Delete term "' + name + '" (ID ' + termId + ') from ' + tax + '?\n\nThis cannot be undone.') ) {
+                        return;
+                    }
+
+                    $btn.prop('disabled', true).text('...');
+                    $status.text('').css('color', '#555');
+
+                    $.ajax({
+                        url: ajaxUrl,
+                        type: 'POST',
+                        dataType: 'json',
+                        data: {
+                            action: 'cleanup_single_term_delete',
+                            nonce: nonceSingle,
+                            term_id: termId,
+                            taxonomy: tax
+                        }
+                    }).done(function(resp){
+                        if ( resp && resp.success ) {
+                            $status.text('✅').css('color', 'green');
+                            $row.fadeOut(350, function(){
+                                $(this).remove();
+                                applyFilters();
+                            });
+                        } else {
+                            var msg = (resp && resp.data && resp.data.message) ? resp.data.message : 'Unknown error';
+                            $status.text('❌ ' + msg).css('color', 'red');
+                            $btn.prop('disabled', false).text('Delete');
+                        }
+                    }).fail(function(xhr){
+                        $status.text('❌ ' + xhr.status).css('color', 'red');
+                        $btn.prop('disabled', false).text('Delete');
+                    });
+                });
+
+                function renumberRows() {
+                    var n = 1;
+                    $('#cleanup-terms-table tbody tr').each(function(){
+                        if ( $(this).is(':visible') ) {
+                            $(this).find('.row-num').text(n++);
+                        }
+                    });
+                }
+            })(jQuery);
+            </script>
+        <?php endif; ?>
+    </div>
+    <?php
+}
+
+// ------------------------------------------------------------------
+// 3. AJAX: delete one term
+// ------------------------------------------------------------------
+add_action( 'wp_ajax_cleanup_single_term_delete', function() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( array( 'message' => 'Permission denied.' ) );
+    }
+    check_ajax_referer( 'cleanup_single_term_nonce', 'nonce' );
+
+    $term_id  = isset( $_POST['term_id'] )  ? absint( $_POST['term_id'] ) : 0;
+    $taxonomy = isset( $_POST['taxonomy'] ) ? sanitize_key( $_POST['taxonomy'] ) : '';
+
+    if ( ! $term_id || empty( $taxonomy ) ) {
+        wp_send_json_error( array( 'message' => 'Missing parameters.' ) );
+    }
+    if ( strpos( $taxonomy, 'pa_' ) !== 0 || ! taxonomy_exists( $taxonomy ) ) {
+        wp_send_json_error( array( 'message' => 'Invalid taxonomy: ' . $taxonomy ) );
+    }
+
+    $term = get_term( $term_id, $taxonomy );
+    if ( ! $term || is_wp_error( $term ) ) {
+        wp_send_json_error( array( 'message' => 'Term not found.' ) );
+    }
+    if ( $term->count > 0 ) {
+        wp_send_json_error( array( 'message' => 'Term is in use (count ' . $term->count . '). Refusing to delete.' ) );
+    }
+
+    $result = wp_delete_term( $term_id, $taxonomy );
+    if ( $result === true ) {
+        if ( function_exists( 'wc_recount_terms' ) ) { wc_recount_terms(); }
+        if ( function_exists( 'wc_delete_product_transients' ) ) { wc_delete_product_transients(); }
+        wp_send_json_success( array( 'message' => 'Deleted.', 'term_id' => $term_id, 'taxonomy' => $taxonomy ) );
+    }
+    wp_send_json_error( array( 'message' => 'Delete failed.' ) );
+} );
+
+// ------------------------------------------------------------------
+// 4. AJAX: bulk delete terms
+// ------------------------------------------------------------------
+add_action( 'wp_ajax_cleanup_bulk_terms_delete', function() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( array( 'message' => 'Permission denied.' ) );
+    }
+    check_ajax_referer( 'cleanup_bulk_terms_nonce', 'nonce' );
+
+    $items = isset( $_POST['items'] ) ? (array) $_POST['items'] : array();
+    if ( empty( $items ) ) {
+        wp_send_json_error( array( 'message' => 'No items selected.' ) );
+    }
+
+    $deleted_ids = array();
+    $failed      = array();
+
+    foreach ( $items as $item ) {
+        $term_id  = isset( $item['term_id'] )  ? absint( $item['term_id'] ) : 0;
+        $taxonomy = isset( $item['taxonomy'] ) ? sanitize_key( $item['taxonomy'] ) : '';
+
+        if ( ! $term_id || empty( $taxonomy ) ) {
+            $failed[] = array( 'term_id' => $term_id, 'reason' => 'missing params' );
+            continue;
+        }
+        if ( strpos( $taxonomy, 'pa_' ) !== 0 || ! taxonomy_exists( $taxonomy ) ) {
+            $failed[] = array( 'term_id' => $term_id, 'reason' => 'invalid taxonomy' );
+            continue;
+        }
+
+        $term = get_term( $term_id, $taxonomy );
+        if ( ! $term || is_wp_error( $term ) ) {
+            $failed[] = array( 'term_id' => $term_id, 'reason' => 'not found' );
+            continue;
+        }
+        if ( $term->count > 0 ) {
+            $failed[] = array( 'term_id' => $term_id, 'reason' => 'in use (count ' . $term->count . ')' );
+            continue;
+        }
+
+        $result = wp_delete_term( $term_id, $taxonomy );
+        if ( $result === true ) {
+            $deleted_ids[] = $term_id;
+        } else {
+            $failed[] = array( 'term_id' => $term_id, 'reason' => 'delete failed' );
+        }
+    }
+
+    if ( function_exists( 'wc_recount_terms' ) ) { wc_recount_terms(); }
+    if ( function_exists( 'wc_delete_product_transients' ) ) { wc_delete_product_transients(); }
+
+    $msg = 'Deleted ' . count( $deleted_ids ) . ' term(s).';
+    if ( count( $failed ) ) {
+        $msg .= ' ' . count( $failed ) . ' failed.';
+    }
+
+    wp_send_json_success( array(
+        'message'     => $msg,
+        'deleted_ids' => $deleted_ids,
+        'failed'      => $failed,
+    ) );
+} );
