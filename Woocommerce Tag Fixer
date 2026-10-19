@@ -1,1 +1,512 @@
+<?php
+/**
+ * AJAX Admin Page: Cleanup unused Product Tags (product_tag).
+ * - Filters: Status (All / Used / Unused) + Search
+ * - Checkbox selection for bulk delete
+ * - Per-row Delete buttons
+ * - Chunked bulk delete with live progress bar + log
+ * - Used tags cannot be selected or deleted
+ */
 
+// ------------------------------------------------------------------
+// 1. Register admin menu page
+// ------------------------------------------------------------------
+add_action( 'admin_menu', function() {
+    add_submenu_page(
+        'woocommerce',
+        'Cleanup Product Tags',
+        'Cleanup Product Tags',
+        'manage_options',
+        'cleanup-product-tags',
+        'cleanup_product_tags_page_html'
+    );
+} );
+
+// ------------------------------------------------------------------
+// 2. Render page
+// ------------------------------------------------------------------
+function cleanup_product_tags_page_html() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_die( 'Insufficient permissions.' );
+    }
+
+    $taxonomy = 'product_tag';
+    if ( ! taxonomy_exists( $taxonomy ) ) {
+        echo '<div class="wrap"><h1>Cleanup Product Tags</h1><p>product_tag taxonomy not found. Is WooCommerce active?</p></div>';
+        return;
+    }
+
+    $all_tags = array();
+    $terms = get_terms( array( 'taxonomy' => $taxonomy, 'hide_empty' => false ) );
+    if ( ! empty( $terms ) && ! is_wp_error( $terms ) ) {
+        foreach ( $terms as $term ) {
+            $all_tags[] = array(
+                'term' => $term,
+                'used' => ( (int) $term->count > 0 ) ? '1' : '0',
+            );
+        }
+    }
+
+    $total_used = 0; $total_unused = 0;
+    foreach ( $all_tags as $t ) {
+        if ( $t['used'] === '1' ) { $total_used++; } else { $total_unused++; }
+    }
+
+    $nonce_single = wp_create_nonce( 'cleanup_single_tag_nonce' );
+    $nonce_bulk   = wp_create_nonce( 'cleanup_bulk_tags_nonce' );
+    ?>
+    <div class="wrap">
+        <h1>Cleanup Product Tags</h1>
+
+        <p style="font-size:14px;">
+            <strong>Total tags:</strong> <?php echo count( $all_tags ); ?> &nbsp;|&nbsp;
+            <strong style="color:#0073aa;">Used (in use):</strong> <?php echo $total_used; ?> &nbsp;|&nbsp;
+            <strong style="color:#b00;">Unused (safe to delete):</strong> <?php echo $total_unused; ?>
+        </p>
+
+        <?php if ( empty( $all_tags ) ) : ?>
+            <div class="notice notice-success"><p>✅ No product tags found.</p></div>
+        <?php else : ?>
+
+            <!-- FILTER BAR -->
+            <div class="tablenav top" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:16px 0;padding:12px;background:#f6f7f7;border:1px solid #dcdcde;border-radius:4px;">
+                <label for="filter-status"><strong>Status:</strong></label>
+                <select id="filter-status">
+                    <option value="all" selected>All tags (used + unused)</option>
+                    <option value="unused">Unused only (safe to delete)</option>
+                    <option value="used">Used only (in use)</option>
+                </select>
+
+                <label for="filter-search"><strong>Search:</strong></label>
+                <input type="search" id="filter-search" placeholder="Tag name or slug..." style="min-width:220px;" />
+
+                <span id="filter-count" style="margin-left:auto;font-weight:600;color:#555;"></span>
+            </div>
+
+            <!-- BULK ACTION BAR -->
+            <div id="bulk-bar" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 12px 0;padding:10px 12px;background:#fff;border:1px solid #dcdcde;border-radius:4px;">
+                <label style="display:flex;align-items:center;gap:6px;">
+                    <input type="checkbox" id="select-all-visible" />
+                    <strong>Select all visible unused</strong>
+                </label>
+                <button type="button" id="clear-selection" class="button">Clear selection</button>
+                <button type="button" id="bulk-delete-btn" class="button button-primary" disabled>
+                    Delete selected (<span id="selected-count">0</span>)
+                </button>
+                <span id="bulk-status" style="font-weight:600;"></span>
+            </div>
+
+            <!-- PROGRESS PANEL (hidden until bulk delete starts) -->
+            <div id="progress-panel" style="display:none;margin:0 0 12px 0;padding:14px 16px;background:#fff;border:1px solid #0073aa;border-radius:4px;">
+                <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+                    <strong id="progress-label">Deleting tags...</strong>
+                    <span id="progress-numbers" style="font-family:monospace;font-weight:600;">0 / 0</span>
+                </div>
+                <div style="background:#e5e5e5;border-radius:6px;height:22px;overflow:hidden;position:relative;">
+                    <div id="progress-bar-fill" style="height:100%;width:0%;background:linear-gradient(90deg,#0073aa,#00a0d2);transition:width 0.25s ease;"></div>
+                    <span id="progress-bar-text" style="position:absolute;left:0;right:0;top:0;line-height:22px;text-align:center;color:#fff;font-weight:600;text-shadow:0 0 2px rgba(0,0,0,.4);">0%</span>
+                </div>
+                <div id="progress-detail" style="margin-top:10px;font-family:monospace;font-size:12px;color:#555;max-height:140px;overflow:auto;background:#f9f9f9;padding:8px;border-radius:4px;border:1px solid #eee;"></div>
+            </div>
+
+            <table class="widefat striped" id="cleanup-tags-table">
+                <thead>
+                    <tr>
+                        <th style="width:40px;"><input type="checkbox" id="header-checkbox" title="Toggle visible unused" /></th>
+                        <th style="width:50px;">#</th>
+                        <th style="width:90px;">Tag ID</th>
+                        <th>Name</th>
+                        <th>Slug</th>
+                        <th style="width:70px;">Count</th>
+                        <th style="width:130px;">Status</th>
+                        <th style="width:110px;">Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php $i = 1; foreach ( $all_tags as $item ) :
+                        $term      = $item['term'];
+                        $used_flag = $item['used'];
+                        $is_used   = ( $used_flag === '1' );
+                        ?>
+                        <tr data-term-id="<?php echo esc_attr( $term->term_id ); ?>"
+                            data-used="<?php echo esc_attr( $used_flag ); ?>"
+                            data-name="<?php echo esc_attr( strtolower( $term->name ) ); ?>"
+                            data-slug="<?php echo esc_attr( strtolower( $term->slug ) ); ?>"
+                            style="<?php echo $is_used ? 'background:#eef6ff;' : ''; ?>">
+                            <td>
+                                <?php if ( ! $is_used ) : ?>
+                                    <input type="checkbox" class="term-checkbox"
+                                           value="<?php echo esc_attr( $term->term_id ); ?>"
+                                           data-name="<?php echo esc_attr( $term->name ); ?>" />
+                                <?php endif; ?>
+                            </td>
+                            <td class="row-num"><?php echo $i++; ?></td>
+                            <td><?php echo esc_html( $term->term_id ); ?></td>
+                            <td class="term-name"><?php echo esc_html( $term->name ); ?></td>
+                            <td class="term-slug"><?php echo esc_html( $term->slug ); ?></td>
+                            <td><strong><?php echo esc_html( $term->count ); ?></strong></td>
+                            <td>
+                                <?php if ( $is_used ) : ?>
+                                    <span style="color:#0073aa;font-weight:600;">● Used</span>
+                                <?php else : ?>
+                                    <span style="color:#b00;font-weight:600;">○ Unused</span>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?php if ( ! $is_used ) : ?>
+                                    <button type="button"
+                                            class="button button-primary delete-tag-btn"
+                                            data-term-id="<?php echo esc_attr( $term->term_id ); ?>"
+                                            data-term-name="<?php echo esc_attr( $term->name ); ?>">
+                                        Delete
+                                    </button>
+                                    <span class="term-status" style="margin-left:4px;font-weight:600;"></span>
+                                <?php else : ?>
+                                    <span style="color:#aaa;">—</span>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+
+            <div id="no-match-notice" class="notice notice-warning" style="display:none;margin-top:12px;">
+                <p>No tags match the current filters.</p>
+            </div>
+
+            <script>
+            (function($){
+                var nonceSingle = <?php echo wp_json_encode( $nonce_single ); ?>;
+                var nonceBulk   = <?php echo wp_json_encode( $nonce_bulk ); ?>;
+                var ajaxUrl     = <?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>;
+                var CHUNK_SIZE  = 20; // tags per AJAX request
+
+                // -------- FILTERING --------
+                function applyFilters() {
+                    var status = String( $('#filter-status').val() || 'all' );
+                    var q      = $.trim( String( $('#filter-search').val() || '' ) ).toLowerCase();
+                    var visible = 0;
+
+                    $('#cleanup-tags-table tbody tr').each(function(){
+                        var $row = $(this);
+                        var rowUsed = String( $row.attr('data-used') || '0' );
+                        var rowName = String( $row.attr('data-name') || '' );
+                        var rowSlug = String( $row.attr('data-slug') || '' );
+
+                        var statusOk = true;
+                        if ( status === 'unused' ) statusOk = ( rowUsed === '0' );
+                        if ( status === 'used' )   statusOk = ( rowUsed === '1' );
+
+                        var qOk = ( q === '' ) || ( rowName.indexOf(q) !== -1 ) || ( rowSlug.indexOf(q) !== -1 );
+
+                        if ( statusOk && qOk ) { $row.show(); visible++; }
+                        else { $row.hide(); $row.find('.term-checkbox').prop('checked', false); }
+                    });
+
+                    renumberRows();
+                    updateSelectedCount();
+                    $('#filter-count').text( visible + ' visible' );
+                    $('#no-match-notice').toggle( visible === 0 );
+                }
+
+                $('#filter-status').on('change', applyFilters);
+                $('#filter-search').on('input', applyFilters);
+                applyFilters();
+
+                // -------- SELECTION --------
+                function updateSelectedCount() {
+                    var count = $('.term-checkbox:checked').length;
+                    $('#selected-count').text( count );
+                    var running = $('#bulk-delete-btn').data('running') === true;
+                    $('#bulk-delete-btn').prop('disabled', count === 0 || running);
+
+                    var visibleBoxes   = $('.term-checkbox:visible');
+                    var visibleChecked = visibleBoxes.filter(':checked').length;
+                    var $all = $('#select-all-visible');
+                    if ( visibleBoxes.length === 0 )                        { $all.prop('checked', false).prop('indeterminate', false); }
+                    else if ( visibleChecked === visibleBoxes.length )      { $all.prop('checked', true).prop('indeterminate', false); }
+                    else if ( visibleChecked === 0 )                        { $all.prop('checked', false).prop('indeterminate', false); }
+                    else                                                    { $all.prop('indeterminate', true); }
+                }
+
+                $(document).on('change', '.term-checkbox', updateSelectedCount);
+
+                $('#select-all-visible, #header-checkbox').on('change', function(){
+                    var checked = $(this).prop('checked');
+                    $('.term-checkbox:visible').prop('checked', checked);
+                    $('#select-all-visible').prop('checked', checked);
+                    $('#header-checkbox').prop('checked', checked);
+                    updateSelectedCount();
+                });
+
+                $('#clear-selection').on('click', function(){
+                    $('.term-checkbox').prop('checked', false);
+                    $('#select-all-visible, #header-checkbox').prop('checked', false).prop('indeterminate', false);
+                    updateSelectedCount();
+                });
+
+                // -------- PROGRESS UI --------
+                function showProgress(total) {
+                    $('#progress-panel').show();
+                    $('#progress-bar-fill').css('width', '0%');
+                    $('#progress-bar-text').text('0%');
+                    $('#progress-numbers').text('0 / ' + total);
+                    $('#progress-label').text('Deleting ' + total + ' tag(s)...');
+                    $('#progress-detail').empty();
+                }
+                function updateProgress(done, total, failed) {
+                    var pct = total ? Math.round((done / total) * 100) : 0;
+                    $('#progress-bar-fill').css('width', pct + '%');
+                    $('#progress-bar-text').text(pct + '%');
+                    $('#progress-numbers').text(done + ' / ' + total + (failed ? ' (' + failed + ' failed)' : ''));
+                }
+                function logDetail(msg, color) {
+                    var $d = $('#progress-detail');
+                    $d.append( $('<div>').text(msg).css('color', color || '#555') );
+                    $d.scrollTop($d[0].scrollHeight);
+                }
+
+                // -------- BULK DELETE (CHUNKED WITH PROGRESS) --------
+                $('#bulk-delete-btn').on('click', function(){
+                    var selected = $('.term-checkbox:checked');
+                    if ( selected.length === 0 ) { return; }
+
+                    var items = [];
+                    selected.each(function(){
+                        items.push({ term_id: $(this).val(), name: $(this).attr('data-name') });
+                    });
+
+                    if ( ! confirm('Delete ' + items.length + ' selected tag(s)?\n\nThis cannot be undone.') ) {
+                        return;
+                    }
+
+                    var $btn = $(this);
+                    $btn.data('running', true).prop('disabled', true).text('Deleting...');
+
+                    var total        = items.length;
+                    var processed    = 0;
+                    var deletedCount = 0;
+                    var failedCount  = 0;
+                    var deletedIds   = [];
+
+                    showProgress(total);
+                    $('#bulk-status').text('').css('color', '#555');
+
+                    function processNextChunk() {
+                        if ( processed >= total ) {
+                            // All chunks complete
+                            var msg = 'Deleted ' + deletedCount + ' tag(s).';
+                            if ( failedCount ) { msg += ' ' + failedCount + ' failed.'; }
+                            var color = failedCount ? '#b00' : 'green';
+                            var icon  = failedCount ? '⚠️' : '✅';
+                            $('#bulk-status').html('<span style="color:' + color + ';">' + icon + ' ' + msg + '</span>');
+                            $('#progress-label').text('Complete — ' + msg);
+                            updateProgress(total, total, failedCount);
+
+                            // Remove deleted rows
+                            $.each( deletedIds, function(_, id){
+                                $('#cleanup-tags-table tr[data-term-id="' + id + '"]').fadeOut(250, function(){
+                                    $(this).remove();
+                                    applyFilters();
+                                });
+                            });
+
+                            // Reset button state
+                            $btn.data('running', false)
+                                .text('Delete selected (' + $('.term-checkbox:checked').length + ')')
+                                .prop('disabled', $('.term-checkbox:checked').length === 0);
+
+                            return;
+                        }
+
+                        var chunk = items.slice(processed, processed + CHUNK_SIZE);
+
+                        $.ajax({
+                            url: ajaxUrl,
+                            type: 'POST',
+                            dataType: 'json',
+                            data: {
+                                action: 'cleanup_bulk_tags_delete',
+                                nonce: nonceBulk,
+                                items: chunk
+                            }
+                        }).done(function(resp){
+                            if ( resp && resp.success ) {
+                                var ids = resp.data.deleted_ids || [];
+                                deletedCount += ids.length;
+
+                                $.each( ids, function(_, id){
+                                    deletedIds.push(id);
+                                    var name = $('#cleanup-tags-table tr[data-term-id="' + id + '"] .term-name').text() || ('#' + id);
+                                    logDetail('✅ Deleted: ' + name, 'green');
+                                });
+
+                                $.each( resp.data.failed || [], function(_, f){
+                                    failedCount++;
+                                    logDetail('❌ #' + f.term_id + ' — ' + (f.reason || 'failed'), '#b00');
+                                });
+
+                                processed += chunk.length;
+                                updateProgress(processed, total, failedCount);
+
+                                // Continue to next chunk
+                                processNextChunk();
+                            } else {
+                                var msg = (resp && resp.data && resp.data.message) ? resp.data.message : 'Unknown error';
+                                logDetail('❌ Chunk failed: ' + msg, '#b00');
+                                failedCount += chunk.length;
+                                processed   += chunk.length;
+                                updateProgress(processed, total, failedCount);
+                                processNextChunk();
+                            }
+                        }).fail(function(xhr){
+                            logDetail('❌ Network error on chunk (' + xhr.status + ') — retrying skipped items next run', '#b00');
+                            failedCount += chunk.length;
+                            processed   += chunk.length;
+                            updateProgress(processed, total, failedCount);
+                            processNextChunk();
+                        });
+                    }
+
+                    processNextChunk();
+                });
+
+                // -------- PER-ROW DELETE --------
+                $(document).on('click', '.delete-tag-btn', function(){
+                    var $btn    = $(this);
+                    var termId  = $btn.data('term-id');
+                    var name    = $btn.data('term-name');
+                    var $row    = $btn.closest('tr');
+                    var $status = $row.find('.term-status');
+
+                    if ( ! confirm('Delete tag "' + name + '" (ID ' + termId + ')?\n\nThis cannot be undone.') ) {
+                        return;
+                    }
+
+                    $btn.prop('disabled', true).text('...');
+                    $status.text('').css('color', '#555');
+
+                    $.ajax({
+                        url: ajaxUrl,
+                        type: 'POST',
+                        dataType: 'json',
+                        data: {
+                            action: 'cleanup_single_tag_delete',
+                            nonce: nonceSingle,
+                            term_id: termId
+                        }
+                    }).done(function(resp){
+                        if ( resp && resp.success ) {
+                            $status.text('✅').css('color', 'green');
+                            $row.fadeOut(350, function(){
+                                $(this).remove();
+                                applyFilters();
+                            });
+                        } else {
+                            var msg = (resp && resp.data && resp.data.message) ? resp.data.message : 'Unknown error';
+                            $status.text('❌ ' + msg).css('color', 'red');
+                            $btn.prop('disabled', false).text('Delete');
+                        }
+                    }).fail(function(xhr){
+                        $status.text('❌ ' + xhr.status).css('color', 'red');
+                        $btn.prop('disabled', false).text('Delete');
+                    });
+                });
+
+                function renumberRows() {
+                    var n = 1;
+                    $('#cleanup-tags-table tbody tr').each(function(){
+                        if ( $(this).is(':visible') ) {
+                            $(this).find('.row-num').text(n++);
+                        }
+                    });
+                }
+            })(jQuery);
+            </script>
+        <?php endif; ?>
+    </div>
+    <?php
+}
+
+// ------------------------------------------------------------------
+// 3. AJAX: delete one tag
+// ------------------------------------------------------------------
+add_action( 'wp_ajax_cleanup_single_tag_delete', function() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( array( 'message' => 'Permission denied.' ) );
+    }
+    check_ajax_referer( 'cleanup_single_tag_nonce', 'nonce' );
+
+    $term_id = isset( $_POST['term_id'] ) ? absint( $_POST['term_id'] ) : 0;
+    if ( ! $term_id ) {
+        wp_send_json_error( array( 'message' => 'Missing term ID.' ) );
+    }
+
+    $term = get_term( $term_id, 'product_tag' );
+    if ( ! $term || is_wp_error( $term ) ) {
+        wp_send_json_error( array( 'message' => 'Tag not found.' ) );
+    }
+    if ( $term->count > 0 ) {
+        wp_send_json_error( array( 'message' => 'Tag is in use (count ' . $term->count . '). Refusing to delete.' ) );
+    }
+
+    $result = wp_delete_term( $term_id, 'product_tag' );
+    if ( $result === true ) {
+        if ( function_exists( 'wc_recount_terms' ) ) { wc_recount_terms(); }
+        if ( function_exists( 'wc_delete_product_transients' ) ) { wc_delete_product_transients(); }
+        wp_send_json_success( array( 'message' => 'Deleted.', 'term_id' => $term_id ) );
+    }
+    wp_send_json_error( array( 'message' => 'Delete failed.' ) );
+} );
+
+// ------------------------------------------------------------------
+// 4. AJAX: bulk delete tags (chunk-safe — processes an array of items)
+// ------------------------------------------------------------------
+add_action( 'wp_ajax_cleanup_bulk_tags_delete', function() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( array( 'message' => 'Permission denied.' ) );
+    }
+    check_ajax_referer( 'cleanup_bulk_tags_nonce', 'nonce' );
+
+    $items = isset( $_POST['items'] ) ? (array) $_POST['items'] : array();
+    if ( empty( $items ) ) {
+        wp_send_json_error( array( 'message' => 'No items in chunk.' ) );
+    }
+
+    $deleted_ids = array();
+    $failed      = array();
+
+    foreach ( $items as $item ) {
+        $term_id = isset( $item['term_id'] ) ? absint( $item['term_id'] ) : 0;
+
+        if ( ! $term_id ) {
+            $failed[] = array( 'term_id' => $term_id, 'reason' => 'missing term_id' );
+            continue;
+        }
+
+        $term = get_term( $term_id, 'product_tag' );
+        if ( ! $term || is_wp_error( $term ) ) {
+            $failed[] = array( 'term_id' => $term_id, 'reason' => 'not found' );
+            continue;
+        }
+        if ( $term->count > 0 ) {
+            $failed[] = array( 'term_id' => $term_id, 'reason' => 'in use (count ' . $term->count . ')' );
+            continue;
+        }
+
+        $result = wp_delete_term( $term_id, 'product_tag' );
+        if ( $result === true ) {
+            $deleted_ids[] = $term_id;
+        } else {
+            $failed[] = array( 'term_id' => $term_id, 'reason' => 'delete failed' );
+        }
+    }
+
+    // Recount after every chunk so counts stay honest even mid-run
+    if ( function_exists( 'wc_recount_terms' ) ) { wc_recount_terms(); }
+
+    wp_send_json_success( array(
+        'deleted_ids' => $deleted_ids,
+        'failed'      => $failed,
+    ) );
+} );
