@@ -1,1 +1,13 @@
 
+
+add_action( 'admin_notices', function() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        return;
+    }
+
+    $sizes = wp_get_registered_image_subsizes();
+
+    echo '<div class="notice notice-info is-dismissible"><pre>';
+    print_r( $sizes );
+    echo '</pre></div>';
+} );
